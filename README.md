@@ -1,1 +1,0 @@
-# golang-bitcoin-segwit

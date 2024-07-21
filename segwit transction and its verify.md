@@ -452,7 +452,7 @@ func (t *Transaction) previousHashSequence() []byte {
 	return hash
 }
 
-func (t *Transaction) p2pkhScrip(h160 []byte) *ScriptSig {
+func  P2pkhScrip(h160 []byte) *ScriptSig {
 	cmd := make([][]byte, 0)
 	cmd = append(cmd, []byte{OP_DUP})
 	cmd = append(cmd, []byte{OP_HASH160})

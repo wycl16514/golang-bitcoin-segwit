@@ -271,9 +271,86 @@ func parseSegwit(bufReader *bufio.Reader) *Transaction {
 
 	return transaction
 }
+
+func (t *Transaction) Serialize() []byte {
+	if t.segwit {
+		return t.serializeSegwit()
+	}
+
+	return t.serializeLegacy()
+}
+
+func (t *Transaction) serializeSegwit() []byte {
+	result := make([]byte, 0)
+	result = append(result, BigIntToLittleEndian(t.version, LITTLE_ENDIAN_4_BYTES)...)
+	result = append(result, []byte{0x00, 0x01}...)
+	inputCount := big.NewInt(int64(len(t.txInputs)))
+	result = append(result, EncodeVarint(inputCount)...)
+	for _, txInput := range t.txInputs {
+		result = append(result, txInput.Serialize()...)
+	}
+
+	outputCount := big.NewInt(int64(len(t.txOutputs)))
+	result = append(result, EncodeVarint(outputCount)...)
+	for _, txOutput := range t.txOutputs {
+		result = append(result, txOutput.Serialize()...)
+	}
+
+	for _, txInput := range t.txInputs {
+		itemCount := big.NewInt(int64(len(txInput.witness)))
+		result = append(result, EncodeVarint(itemCount)...)
+		for _, item := range txInput.witness {
+			itemLen := big.NewInt(int64(len(item)))
+			result = append(result, EncodeVarint(itemLen)...)
+			result = append(result, item...)
+		}
+	}
+
+	result = append(result, BigIntToLittleEndian(t.lockTime, LITTLE_ENDIAN_4_BYTES)...)
+	return result
+}
+
+func (t *Transaction) serializeLegacy() []byte {
+	result := make([]byte, 0)
+	result = append(result, BigIntToLittleEndian(t.version, LITTLE_ENDIAN_4_BYTES)...)
+
+	inputCount := big.NewInt(int64(len(t.txInputs)))
+	result = append(result, EncodeVarint(inputCount)...)
+	/*
+		serialize inputs, need to replace the scritSig of the given input
+		to scriptPubKey of previous transaction
+	*/
+	for i := 0; i < len(t.txInputs); i++ {
+		/*
+			ScriptSig in input is empty, that's the reason for
+			segwit
+		*/
+		result = append(result, t.txInputs[i].Serialize()...)
+	}
+
+	outputCount := big.NewInt(int64(len(t.txOutputs)))
+	result = append(result, EncodeVarint(outputCount)...)
+	for i := 0; i < len(t.txOutputs); i++ {
+		result = append(result, t.txOutputs[i].Serialize()...)
+	}
+
+	result = append(result, BigIntToLittleEndian(t.lockTime, LITTLE_ENDIAN_4_BYTES)...)
+
+	return result
+}
+
+func (t *Transaction) Hash() []byte {
+	hash := ecc.Hash256(string(t.serializeLegacy()))
+	return reverseByteSlice(hash)
+}
 ```
 In the aboved code, when parsing the transaction binary data, we check the segwit marker, if marker is true, we goto parse segwit transaction, the only difference is that we need to add the parsing
-for the witness data chunk, the data contains two object, one is signature the other is pubkey, let's run the aboved code as following:
+for the witness data chunk, the data contains two object, one is signature the other is pubkey. And we need pay attention to computing the hash of the transaction, no matter the it is segwit or not,
+the hash of transaction need to serialize the transaction first, and in the process of serializing the transaction we need to serialize the transaction input, and at that time the ScriptSig for 
+transaction input is Empty! Therefore even we have the transaction hash, but at later time we can change the scriptsig of the transaction input, that means we can change one component of transaction
+without changing its hash!
+
+let's run the aboved code as following:
 
 ```go
 package main
@@ -289,10 +366,67 @@ func main() {
 		panic(err)
 	}
 	transaction.ParseTransaction(txBinary)
+
+       fmt.Printf("hash:%x\n", tx.Hash())
 }
 ```
+Running the code aboved we can get the following result:
+```go
+transaction version:1
+input count is: 1
+hash:d869f854e1f8788bcff294cc83b280942a8c728de71eb709a2c29d10bfe21b7c
+```
 
-Now let's see how to verify the segwit transaction.
+Now let's see how to verify the segwit transaction. When verify segwit transaction, we first need to check the pattern for the ScriptpubKey of privious output, we need to make sure in the command stack,
+there is only two item and the first item is POP_0 and the second is a 20 byte data item, that's why we have following code:
+
+```go
+func (t *Transaction) SetTestnet() {
+	t.testnet = true
+}
+
+func (t *Transaction) IsP2wpkh(script *ScriptSig) bool {
+	/*
+		two items on the command stack, one is POP_0 , the other is
+		20 byte data item
+	*/
+	if len(script.bitcoinOpCode.cmds) != 2 {
+		return false
+	}
+	if script.bitcoinOpCode.cmds[0][0] != byte(OP_0) && len(script.bitcoinOpCode.cmds[1]) != 20 {
+		return false
+	}
+
+	return true
+}
+```
+Then we can call aboved code in main.go like following:
+```go
+func main() {
+	txBinary, err := hex.DecodeString("0100000000010115e180dc28a2327e687facc33f10f2a20da717e5548406f7ae8b4c811072f8560100000000ffffffff0100b4f505000000001976a9141d7cd6c75c2e86f4cbf98eaed221b30bd9a0b92888ac02483045022100df7b7e5cda14ddf91290e02ea10786e03eb11ee36ec02dd862fe9a326bbcb7fd02203f5b4496b667e6e281cc654a2da9e4f08660c620a1051337fa8965f727eb19190121038262a6c6cec93c2d3ecd6c6072efea86d02ff8e3328bbd0242b20af3425990ac00000000")
+	if err != nil {
+		panic(err)
+	}
+	tx := transaction.ParseTransaction(txBinary)
+	fmt.Printf("hash:%x\n", tx.Hash())
+	//check p2wpkh transaction
+	script := tx.GetScript(0, true)
+	isP2wpkh := tx.IsP2wpkh(script)
+	fmt.Printf("is segwit: %v\n", isP2wpkh)
+}
+```
+Running aboved code will have result like this:
+```go
+transaction version:1
+input count is: 1
+is segwit: true
+```
+
+There are several steps need to verify the transaction. As we have seen aboved, the script pattern for segwit transaction is the first element of command stack is OP_0 instruction and the second
+is a 20 byte data, this 20 byte data is the result of hash160 for a given data chunk, this data chunk can be construct by BIP01433 spec, let's see how to construct this data chunk as following:
+```go
+
+```
 
 
 

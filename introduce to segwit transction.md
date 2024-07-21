@@ -422,11 +422,143 @@ input count is: 1
 is segwit: true
 ```
 
-There are several steps need to verify the transaction. As we have seen aboved, the script pattern for segwit transaction is the first element of command stack is OP_0 instruction and the second
-is a 20 byte data, this 20 byte data is the result of hash160 for a given data chunk, this data chunk can be construct by BIP01433 spec, let's see how to construct this data chunk as following:
+In order to verify segwit transaction, we need to construct the vierify message, this is done by following the steps given by BIP0134, we implement it as following:
 ```go
+func (t *Transaction) previousTxInBIP134Hash() []byte {
+	allPreviousOut := make([]byte, 0)
+	for _, txIn := range t.txInputs {
+		allPreviousOut = append(allPreviousOut, reverseByteSlice(txIn.previousTransactionID)...)
+		allPreviousOut = append(allPreviousOut, BigIntToLittleEndian(txIn.previousTransactionIndex, LITTLE_ENDIAN_4_BYTES)...)
+	}
+	hash := ecc.Hash256(string(allPreviousOut))
+	return hash
+}
+
+func (t *Transaction) txOutBIP134Hash() []byte {
+	hashOut := make([]byte, 0)
+	for _, txOut := range t.txOutputs {
+		hashOut = append(hashOut, txOut.Serialize()...)
+	}
+
+	return ecc.Hash256(string(hashOut))
+}
+
+func (t *Transaction) previousHashSequence() []byte {
+	allSequence := make([]byte, 0)
+	for _, txIn := range t.txInputs {
+		allSequence = append(allSequence, BigIntToLittleEndian(txIn.sequence, LITTLE_ENDIAN_4_BYTES)...)
+	}
+	hash := ecc.Hash256(string(allSequence))
+	return hash
+}
+
+func (t *Transaction) p2pkhScrip(h160 []byte) *ScriptSig {
+	cmd := make([][]byte, 0)
+	cmd = append(cmd, []byte{OP_DUP})
+	cmd = append(cmd, []byte{OP_HASH160})
+	cmd = append(cmd, h160)
+	cmd = append(cmd, []byte{OP_EQUALVERIFY})
+	cmd = append(cmd, []byte{OP_CHECKSIG})
+	return InitScriptSig(cmd)
+}
+
+func (t *Transaction) BIP143SigHash(inputIdx int) []byte {
+	txInput := t.txInputs[inputIdx]
+	//construct hash
+	result := make([]byte, 0)
+	result = append(result, BigIntToLittleEndian(t.version, LITTLE_ENDIAN_4_BYTES)...)
+	result = append(result, t.previousTxInBIP134Hash()...)
+	result = append(result, t.previousHashSequence()...)
+	result = append(result, reverseByteSlice(txInput.previousTransactionID)...)
+	result = append(result, BigIntToLittleEndian(txInput.previousTransactionIndex, LITTLE_ENDIAN_4_BYTES)...)
+	script := t.GetScript(inputIdx, true)
+	p2pkScript := P2pkScript(script.bitcoinOpCode.cmds[1])
+	result = append(result, p2pkScript.Serialize()...)
+	result = append(result, BigIntToLittleEndian(txInput.Value(t.testnet), LITTLE_ENDIAN_8_BYTES)...)
+	result = append(result, BigIntToLittleEndian(txInput.sequence, LITTLE_ENDIAN_4_BYTES)...)
+	result = append(result, t.txOutBIP134Hash()...)
+	result = append(result, BigIntToLittleEndian(t.lockTime, LITTLE_ENDIAN_4_BYTES)...)
+	sigHashAll := big.NewInt(int64(SIGHASH_ALL))
+	result = append(result, BigIntToLittleEndian(sigHashAll, LITTLE_ENDIAN_4_BYTES)...)
+	hashResult := ecc.Hash256(string(result))
+	return hashResult
+}
 
 ```
+Then we can test the code aboved in main.go:
+```g
+func main() {
+	txBinary, err := hex.DecodeString("0100000000010115e180dc28a2327e687facc33f10f2a20da717e5548406f7ae8b4c811072f8560100000000ffffffff0100b4f505000000001976a9141d7cd6c75c2e86f4cbf98eaed221b30bd9a0b92888ac02483045022100df7b7e5cda14ddf91290e02ea10786e03eb11ee36ec02dd862fe9a326bbcb7fd02203f5b4496b667e6e281cc654a2da9e4f08660c620a1051337fa8965f727eb19190121038262a6c6cec93c2d3ecd6c6072efea86d02ff8e3328bbd0242b20af3425990ac00000000")
+	if err != nil {
+		panic(err)
+	}
+	tx := transaction.ParseTransaction(txBinary)
+	tx.SetTestnet()
+	fmt.Printf("hash:%x\n", tx.Hash())
+	//check p2wpkh transaction
+	script := tx.GetScript(0, true)
+	isP2wpkh := tx.IsP2wpkh(script)
+	fmt.Printf("is segwit: %v\n", isP2wpkh)
+
+	//BIP0134 verify message
+	z := tx.BIP143SigHash(0)
+	fmt.Printf("verify msg: %x\n", z)
+}
+```
+The result of running code aboved is :
+```go
+transaction version:1
+input count is: 1
+verify msg: 645a6a03b756ef2adca77e00905810f407876b44ed2b9ea5f6383a1da0b339f0
+```
+
+When verifying the transaction, we need to extract the signature and pubkey from the witness data and we can make up the script command as shown in aboved image, we will do it by following code, 
+in op.go:
+```go
+type BitcoinOpCode struct {
+	opCodeNames map[int]string
+	stack       [][]byte
+	altStack    [][]byte
+	cmds        [][]byte
+	witness     [][]byte
+}
+
+const (
+	/*
+		self defined command not bitcoin script command, when evalute this
+		command, scriptsig will get singature and pubkey from witness data,
+		and construct P2pkhScrip
+	*/
+	OP_P2PWPKH = 253
+   ....
+)
+
+func (b *BitcoinOpCode) isP2wpkh() bool {
+	if len(b.cmds) == 2 && b.cmds[0][0] == OP_0 && len(b.cmds[1]) == 20 {
+		return true
+	}
+
+	return false
+}
+
+func (b *BitcoinOpCode) AppendDataElement(element []byte) {
+	b.stack = append(b.stack, element)
+	/*
+		everytime we push a data element, we need to check the command stack
+		meet the pattern of p2sh
+	*/
+	if b.isP2sh() {
+		//insert the OP_P2SH to the head of the command stack
+		b.cmds = append([][]byte{[]byte{OP_P2SH}}, b.cmds...)
+	}
+
+	if b.isP2wpkh() {
+		b.cmds = append([][]byte{[]byte{OP_P2PWPKH}}, b.cmds...)
+	}
+}
+```
+
+Then in 
 
 
 

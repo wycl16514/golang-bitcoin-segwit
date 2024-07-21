@@ -523,15 +523,7 @@ type BitcoinOpCode struct {
 	witness     [][]byte
 }
 
-const (
-	/*
-		self defined command not bitcoin script command, when evalute this
-		command, scriptsig will get singature and pubkey from witness data,
-		and construct P2pkhScrip
-	*/
-	OP_P2PWPKH = 253
-   ....
-)
+
 
 func (b *BitcoinOpCode) isP2wpkh() bool {
 	if len(b.cmds) == 2 && b.cmds[0][0] == OP_0 && len(b.cmds[1]) == 20 {
@@ -541,24 +533,83 @@ func (b *BitcoinOpCode) isP2wpkh() bool {
 	return false
 }
 
-func (b *BitcoinOpCode) AppendDataElement(element []byte) {
-	b.stack = append(b.stack, element)
-	/*
-		everytime we push a data element, we need to check the command stack
-		meet the pattern of p2sh
-	*/
-	if b.isP2sh() {
-		//insert the OP_P2SH to the head of the command stack
-		b.cmds = append([][]byte{[]byte{OP_P2SH}}, b.cmds...)
+func (b *BitcoinOpCode) handleP2wpkh() {
+	if len(b.cmds) == 2 && b.cmds[0][0] == OP_0 && len(b.cmds[1]) == 20 {
+		b.RemoveCmd()
+		//remove OP_0
+		h160 := b.RemoveCmd()
+
+		//set up signature and pubkey
+		b.cmds = append(b.cmds, b.witness...)
+		//set up p2pk verify command
+		p2sh := P2pkScript(h160)
+		b.cmds = append(b.cmds, p2sh.bitcoinOpCode.cmds...)
+	}
+}
+
+```
+
+Then in script.go:
+```go
+func (s *ScriptSig) SetWitness(witness [][]byte) {
+	s.bitcoinOpCode.witness = witness
+}
+
+func (s *ScriptSig) Evaluate(z []byte) bool {
+	s.bitcoinOpCode.handleP2wpkh()
+        ...
+}
+```
+Then in transaction.go:
+```go
+func (t *Transaction) VerifyInput(inputIndex int) bool {
+	verifyScript := t.GetScript(inputIndex, t.testnet)
+	if t.IsP2wpkh(verifyScript) != true {
+		z := t.SignHash(inputIndex)
+		return verifyScript.Evaluate(z)
 	}
 
-	if b.isP2wpkh() {
-		b.cmds = append([][]byte{[]byte{OP_P2PWPKH}}, b.cmds...)
-	}
+	//verify segwit transaction
+	z := t.BIP143SigHash(inputIndex)
+	witness := t.txInputs[inputIndex].witness
+	verifyScript.SetWitness(witness)
+	return verifyScript.Evaluate(z)
 }
 ```
 
-Then in 
+Finally in main.go:
+```go
+func main() {
+	txBinary, err := hex.DecodeString("0100000000010115e180dc28a2327e687facc33f10f2a20da717e5548406f7ae8b4c811072f8560100000000ffffffff0100b4f505000000001976a9141d7cd6c75c2e86f4cbf98eaed221b30bd9a0b92888ac02483045022100df7b7e5cda14ddf91290e02ea10786e03eb11ee36ec02dd862fe9a326bbcb7fd02203f5b4496b667e6e281cc654a2da9e4f08660c620a1051337fa8965f727eb19190121038262a6c6cec93c2d3ecd6c6072efea86d02ff8e3328bbd0242b20af3425990ac00000000")
+	if err != nil {
+		panic(err)
+	}
+	tx := transaction.ParseTransaction(txBinary)
+	tx.SetTestnet()
+	fmt.Printf("hash:%x\n", tx.Hash())
+	//check p2wpkh transaction
+	script := tx.GetScript(0, true)
+	isP2wpkh := tx.IsP2wpkh(script)
+	fmt.Printf("is segwit: %v\n", isP2wpkh)
+
+	//BIP0134 verify message
+	z := tx.BIP143SigHash(0)
+	fmt.Printf("verify msg: %x\n", z)
+
+	//verify the transaction
+	res := tx.Verify()
+	fmt.Printf("segwit verify resut: %v\n", res)
+}
+```
+
+Run the aboved code we get the following result:
+```go
+transaction version:1
+input count is: 1
+segwit verify resut: true
+```
+
+That means we successfully verify the segwit transaction!
 
 
 
